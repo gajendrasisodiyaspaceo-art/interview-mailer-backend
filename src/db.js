@@ -18,7 +18,10 @@ db.exec(`
     sender_name TEXT DEFAULT '',
     send_time TEXT DEFAULT '09:00',
     timezone TEXT DEFAULT 'Asia/Kolkata',
-    last_run_date TEXT DEFAULT ''
+    last_run_date TEXT DEFAULT '',
+    google_access_token TEXT DEFAULT '',
+    google_refresh_token TEXT DEFAULT '',
+    google_email TEXT DEFAULT ''
   );
 
   CREATE TABLE IF NOT EXISTS template (
@@ -51,6 +54,14 @@ db.exec(`
     sent_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
 `);
+
+// migrate: add google columns if missing
+const cols = db.prepare("PRAGMA table_info(settings)").all().map(c => c.name);
+if (!cols.includes('google_access_token')) {
+  db.exec(`ALTER TABLE settings ADD COLUMN google_access_token TEXT DEFAULT ''`);
+  db.exec(`ALTER TABLE settings ADD COLUMN google_refresh_token TEXT DEFAULT ''`);
+  db.exec(`ALTER TABLE settings ADD COLUMN google_email TEXT DEFAULT ''`);
+}
 
 const settingsRow = db.prepare('SELECT id FROM settings WHERE id = 1').get();
 if (!settingsRow) {

@@ -1,5 +1,5 @@
 const fs = require('fs');
-const { Resend } = require('resend');
+const { google } = require('googleapis');
 const { db } = require('./db');
 
 function getSettings() {
@@ -10,38 +10,77 @@ function getTemplate() {
   return db.prepare('SELECT * FROM template WHERE id = 1').get();
 }
 
-async function sendOne({ to, subject, body, attachmentPath, attachmentName, fromUser, fromName }) {
-  const apiKey = process.env.RESEND_API_KEY;
-  if (!apiKey) throw new Error('RESEND_API_KEY not set');
-
-  const resend = new Resend(apiKey);
-
-  const fromLabel = fromName ? `${fromName} <${fromUser}>` : fromUser;
-
-  const payload = {
-    from: fromLabel,
-    to: [to],
-    subject,
-    text: body,
-    reply_to: fromUser,
-  };
-
-  if (attachmentPath && fs.existsSync(attachmentPath)) {
-    const content = fs.readFileSync(attachmentPath).toString('base64');
-    payload.attachments = [
-      {
-        filename: attachmentName || 'resume.pdf',
-        content,
-      },
-    ];
-  }
-
-  const { data, error } = await resend.emails.send(payload);
-  if (error) throw new Error(error.message || JSON.stringify(error));
-  return data;
+function getOAuthClient(settings) {
+  const client = new google.auth.OAuth2(
+    process.env.GOOGLE_CLIENT_ID,
+    process.env.GOOGLE_CLIENT_SECRET,
+    process.env.GOOGLE_REDIRECT_URI || 'https://interview-mailer-backend.onrender.com/auth/google/callback'
+  );
+  client.setCredentials({
+    access_token: settings.google_access_token,
+    refresh_token: settings.google_refresh_token,
+  });
+  // persist refreshed tokens automatically
+  client.on('tokens', (tokens) => {
+    if (tokens.access_token) {
+      db.prepare("UPDATE settings SET google_access_token=? WHERE id=1").run(tokens.access_token);
+    }
+  });
+  return client;
 }
 
-async function processQueue({ force = false } = {}) {
+function buildRawEmail({ from, to, subject, body, attachmentPath, attachmentName }) {
+  const boundary = 'boundary_' + Date.now();
+  const hasAttachment = attachmentPath && fs.existsSync(attachmentPath);
+
+  let raw = [
+    `From: ${from}`,
+    `To: ${to}`,
+    `Subject: ${subject}`,
+    'MIME-Version: 1.0',
+  ];
+
+  if (hasAttachment) {
+    raw.push(`Content-Type: multipart/mixed; boundary="${boundary}"`);
+    raw.push('');
+    raw.push(`--${boundary}`);
+    raw.push('Content-Type: text/plain; charset=utf-8');
+    raw.push('');
+    raw.push(body);
+    raw.push('');
+    raw.push(`--${boundary}`);
+    const fileContent = fs.readFileSync(attachmentPath).toString('base64');
+    const filename = attachmentName || 'resume.pdf';
+    raw.push(`Content-Type: application/octet-stream; name="${filename}"`);
+    raw.push(`Content-Disposition: attachment; filename="${filename}"`);
+    raw.push('Content-Transfer-Encoding: base64');
+    raw.push('');
+    raw.push(fileContent);
+    raw.push('');
+    raw.push(`--${boundary}--`);
+  } else {
+    raw.push('Content-Type: text/plain; charset=utf-8');
+    raw.push('');
+    raw.push(body);
+  }
+
+  const rawStr = raw.join('\r\n');
+  return Buffer.from(rawStr).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+async function sendOne({ to, subject, body, attachmentPath, attachmentName, settings }) {
+  const auth = getOAuthClient(settings);
+  const gmail = google.gmail({ version: 'v1', auth });
+
+  const from = settings.sender_name
+    ? `"${settings.sender_name}" <${settings.google_email}>`
+    : settings.google_email;
+
+  const raw = buildRawEmail({ from, to, subject, body, attachmentPath, attachmentName });
+  await gmail.users.messages.send({ userId: 'me', requestBody: { raw } });
+}
+
+async function processQueue() {
   const settings = getSettings();
   const template = getTemplate();
   const pending = db.prepare("SELECT * FROM emails WHERE status = 'pending'").all();
@@ -50,13 +89,12 @@ async function processQueue({ force = false } = {}) {
     return { processed: 0, mode: 'noop', results: [] };
   }
 
-  const hasResend = !!process.env.RESEND_API_KEY;
-  const dryRun = !settings.smtp_user || !hasResend;
+  const dryRun = !settings.google_refresh_token;
   const mode = dryRun ? 'dry_run' : 'real';
   const results = [];
 
-  const markSent = db.prepare("UPDATE emails SET status = 'sent', sent_at = datetime('now') WHERE id = ?");
-  const markFailed = db.prepare("UPDATE emails SET status = 'failed' WHERE id = ?");
+  const markSent = db.prepare("UPDATE emails SET status='sent', sent_at=datetime('now') WHERE id=?");
+  const markFailed = db.prepare("UPDATE emails SET status='failed' WHERE id=?");
   const insertHistory = db.prepare(`
     INSERT INTO history (email_id, email, company, role, status, mode, error_message)
     VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -64,13 +102,12 @@ async function processQueue({ force = false } = {}) {
 
   for (const row of pending) {
     if (dryRun) {
-      console.log(`[DRY RUN] Would have sent to ${row.email} (${row.company || 'no company'})`);
+      console.log(`[DRY RUN] Would send to ${row.email}`);
       markSent.run(row.id);
       insertHistory.run(row.id, row.email, row.company, row.role, 'sent', 'dry_run', '');
       results.push({ email: row.email, status: 'sent', mode: 'dry_run' });
       continue;
     }
-
     try {
       await sendOne({
         to: row.email,
@@ -78,15 +115,14 @@ async function processQueue({ force = false } = {}) {
         body: template.body,
         attachmentPath: template.resume_path,
         attachmentName: template.resume_original_name,
-        fromUser: settings.smtp_user,
-        fromName: settings.sender_name,
+        settings,
       });
       markSent.run(row.id);
       insertHistory.run(row.id, row.email, row.company, row.role, 'sent', 'real', '');
       results.push({ email: row.email, status: 'sent', mode: 'real' });
       console.log(`[SENT] ${row.email}`);
     } catch (err) {
-      const msg = err && err.message ? err.message : String(err);
+      const msg = err?.message || String(err);
       markFailed.run(row.id);
       insertHistory.run(row.id, row.email, row.company, row.role, 'failed', 'real', msg);
       results.push({ email: row.email, status: 'failed', mode: 'real', error: msg });

@@ -11,6 +11,7 @@ const resumeRouter = require('./routes/resume');
 const emailsRouter = require('./routes/emails');
 const historyRouter = require('./routes/history');
 const runRouter = require('./routes/run');
+const authRouter = require('./routes/auth');
 
 const PORT = Number(process.env.PORT) || 4000;
 const app = express();
@@ -20,6 +21,7 @@ app.use(express.json({ limit: '1mb' }));
 
 app.get('/health', (_req, res) => res.json({ ok: true, time: new Date().toISOString() }));
 
+app.use('/auth', authRouter);
 app.use('/settings', settingsRouter);
 app.use('/template', templateRouter);
 app.use('/resume', resumeRouter);
