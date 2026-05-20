@@ -8,6 +8,7 @@ router.get('/', (_req, res) => {
   res.json({
     smtp_user: row.smtp_user || '',
     smtp_pass_set: Boolean(row.smtp_pass),
+    resend_configured: !!process.env.RESEND_API_KEY,
     sender_name: row.sender_name || '',
     send_time: row.send_time || '09:00',
     timezone: row.timezone || 'Asia/Kolkata',

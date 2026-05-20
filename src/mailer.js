@@ -1,5 +1,5 @@
 const fs = require('fs');
-const nodemailer = require('nodemailer');
+const { Resend } = require('resend');
 const { db } = require('./db');
 
 function getSettings() {
@@ -10,37 +10,35 @@ function getTemplate() {
   return db.prepare('SELECT * FROM template WHERE id = 1').get();
 }
 
-function buildTransport(settings) {
-  return nodemailer.createTransport({
-    service: 'gmail',
-    auth: {
-      user: settings.smtp_user,
-      pass: settings.smtp_pass,
-    },
-  });
-}
-
 async function sendOne({ to, subject, body, attachmentPath, attachmentName, fromUser, fromName }) {
-  const transporter = buildTransport({ smtp_user: fromUser, smtp_pass: getSettings().smtp_pass });
-  const fromHeader = fromName ? `"${fromName}" <${fromUser}>` : fromUser;
+  const apiKey = process.env.RESEND_API_KEY;
+  if (!apiKey) throw new Error('RESEND_API_KEY not set');
 
-  const mail = {
-    from: fromHeader,
-    to,
+  const resend = new Resend(apiKey);
+
+  const fromLabel = fromName ? `${fromName} <${fromUser}>` : fromUser;
+
+  const payload = {
+    from: fromLabel,
+    to: [to],
     subject,
     text: body,
+    reply_to: fromUser,
   };
 
   if (attachmentPath && fs.existsSync(attachmentPath)) {
-    mail.attachments = [
+    const content = fs.readFileSync(attachmentPath).toString('base64');
+    payload.attachments = [
       {
         filename: attachmentName || 'resume.pdf',
-        path: attachmentPath,
+        content,
       },
     ];
   }
 
-  return transporter.sendMail(mail);
+  const { data, error } = await resend.emails.send(payload);
+  if (error) throw new Error(error.message || JSON.stringify(error));
+  return data;
 }
 
 async function processQueue({ force = false } = {}) {
@@ -52,7 +50,8 @@ async function processQueue({ force = false } = {}) {
     return { processed: 0, mode: 'noop', results: [] };
   }
 
-  const dryRun = !settings.smtp_user || !settings.smtp_pass;
+  const hasResend = !!process.env.RESEND_API_KEY;
+  const dryRun = !settings.smtp_user || !hasResend;
   const mode = dryRun ? 'dry_run' : 'real';
   const results = [];
 
